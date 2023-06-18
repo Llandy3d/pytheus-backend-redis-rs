@@ -88,7 +88,7 @@ impl SingleProcessBackend {
 
 /// A Python module implemented in Rust.
 #[pymodule]
-fn pytheus_backend_redis_rs(_py: Python, m: &PyModule) -> PyResult<()> {
+fn pytheus_backend_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<RedisBackend>()?;
     m.add_class::<SingleProcessBackend>()?;
     Ok(())

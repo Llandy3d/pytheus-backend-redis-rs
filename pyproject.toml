@@ -3,7 +3,7 @@ requires = ["maturin>=1.1,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "pytheus-backend-redis-rs"
+name = "pytheus-backend-rs"
 requires-python = ">=3.8"
 classifiers = [
     "Programming Language :: Rust",
