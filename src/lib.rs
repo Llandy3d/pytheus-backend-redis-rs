@@ -37,7 +37,6 @@ struct RedisBackend {
     metric: Py<PyAny>,
     #[pyo3(get)]
     histogram_bucket: Option<String>,
-    value: f64,
     redis_job_tx: mpsc::Sender<RedisJob>,
 }
 
@@ -59,7 +58,6 @@ impl RedisBackend {
             config: config.into(),
             metric: metric.into(),
             histogram_bucket,
-            value: 0.0,
             redis_job_tx: cloned_tx,
         }
     }
@@ -108,7 +106,6 @@ impl RedisBackend {
     }
 
     fn inc(&mut self, value: f64) {
-        // self.value += value
         self.redis_job_tx
             .send(RedisJob {
                 action: BackendAction::Inc,
@@ -119,7 +116,6 @@ impl RedisBackend {
     }
 
     fn dec(&mut self, value: f64) {
-        // self.value -= value
         self.redis_job_tx
             .send(RedisJob {
                 action: BackendAction::Dec,
@@ -130,7 +126,6 @@ impl RedisBackend {
     }
 
     fn set(&mut self, value: f64) {
-        // self.value = value
         self.redis_job_tx
             .send(RedisJob {
                 action: BackendAction::Set,
@@ -141,12 +136,11 @@ impl RedisBackend {
     }
 
     fn get(&self) -> f64 {
-        // self.value
         let (tx, rx) = mpsc::channel();
         self.redis_job_tx
             .send(RedisJob {
                 action: BackendAction::Get,
-                value: 0.0,
+                value: f64::NAN,
                 result_tx: Some(tx),
             })
             .unwrap();
