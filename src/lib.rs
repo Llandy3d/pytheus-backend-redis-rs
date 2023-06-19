@@ -18,9 +18,15 @@ enum BackendAction {
 }
 
 #[derive(Debug)]
+struct RedisJobResult {
+    value: f64,
+}
+
+#[derive(Debug)]
 struct RedisJob {
     action: BackendAction,
     value: f64,
+    result_tx: Option<mpsc::Sender<RedisJobResult>>,
 }
 
 #[pyclass]
@@ -76,6 +82,25 @@ impl RedisBackend {
 
             while let Ok(received) = rx.recv() {
                 println!("Got: {:?}", received);
+                match received.action {
+                    BackendAction::Inc | BackendAction::Dec => {
+                        let _: () = connection.incr("random", received.value).unwrap();
+                    }
+                    BackendAction::Set => {
+                        let _: () = connection.set("random", received.value).unwrap();
+                    }
+                    BackendAction::Get => {
+                        let value: f64 = connection.get("random").unwrap();
+                        received
+                            .result_tx
+                            .unwrap()
+                            .send(RedisJobResult { value })
+                            .unwrap();
+                    }
+                }
+
+                let val: f64 = connection.get("random").unwrap();
+                println!("val: {val}");
             }
         });
 
@@ -88,20 +113,47 @@ impl RedisBackend {
             .send(RedisJob {
                 action: BackendAction::Inc,
                 value,
+                result_tx: None,
             })
             .unwrap();
     }
 
     fn dec(&mut self, value: f64) {
-        self.value -= value
+        // self.value -= value
+        self.redis_job_tx
+            .send(RedisJob {
+                action: BackendAction::Dec,
+                value: -value,
+                result_tx: None,
+            })
+            .unwrap();
     }
 
     fn set(&mut self, value: f64) {
-        self.value = value
+        // self.value = value
+        self.redis_job_tx
+            .send(RedisJob {
+                action: BackendAction::Set,
+                value,
+                result_tx: None,
+            })
+            .unwrap();
     }
 
     fn get(&self) -> f64 {
-        self.value
+        // self.value
+        let (tx, rx) = mpsc::channel();
+        self.redis_job_tx
+            .send(RedisJob {
+                action: BackendAction::Get,
+                value: 0.0,
+                result_tx: Some(tx),
+            })
+            .unwrap();
+
+        // TODO: should free the GIL in here
+        let job_result = rx.recv().unwrap();
+        job_result.value
     }
 }
 
