@@ -1,4 +1,5 @@
 use pyo3::exceptions::PyException;
+use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
 use redis::Commands;
@@ -25,6 +26,7 @@ struct RedisJobResult {
 #[derive(Debug)]
 struct RedisJob {
     action: BackendAction,
+    key_name: String,
     value: f64,
     result_tx: Option<mpsc::Sender<RedisJobResult>>,
 }
@@ -38,6 +40,7 @@ struct RedisBackend {
     #[pyo3(get)]
     histogram_bucket: Option<String>,
     redis_job_tx: mpsc::Sender<RedisJob>,
+    key_name: String,
 }
 
 fn create_redis_connection() -> RedisResult<Connection> {
@@ -49,21 +52,27 @@ fn create_redis_connection() -> RedisResult<Connection> {
 #[pymethods]
 impl RedisBackend {
     #[new]
-    fn new(config: &PyDict, metric: &PyAny, histogram_bucket: Option<String>) -> Self {
+    fn new(config: &PyDict, metric: &PyAny, histogram_bucket: Option<String>) -> PyResult<Self> {
         let redis_job_tx_mutex = REDIS_JOB_TX.get().unwrap();
         let redis_job_tx = redis_job_tx_mutex.lock().unwrap();
         let cloned_tx = redis_job_tx.clone();
 
-        Self {
+        let key_name: String = metric
+            .getattr(intern!(metric.py(), "_collector"))?
+            .getattr(intern!(metric.py(), "name"))?
+            .extract()?;
+
+        Ok(Self {
             config: config.into(),
             metric: metric.into(),
             histogram_bucket,
             redis_job_tx: cloned_tx,
-        }
+            key_name,
+        })
     }
 
     #[classmethod]
-    fn _initialize(cls: &PyType) -> PyResult<()> {
+    fn _initialize(cls: &PyType, config: &PyDict) -> PyResult<()> {
         println!("hello: {}", cls);
 
         let mut connection = match create_redis_connection() {
@@ -82,13 +91,13 @@ impl RedisBackend {
                 println!("Got: {:?}", received);
                 match received.action {
                     BackendAction::Inc | BackendAction::Dec => {
-                        let _: () = connection.incr("random", received.value).unwrap();
+                        let _: () = connection.incr(&received.key_name, received.value).unwrap();
                     }
                     BackendAction::Set => {
-                        let _: () = connection.set("random", received.value).unwrap();
+                        let _: () = connection.set(&received.key_name, received.value).unwrap();
                     }
                     BackendAction::Get => {
-                        let value: f64 = connection.get("random").unwrap();
+                        let value: f64 = connection.get(&received.key_name).unwrap();
                         received
                             .result_tx
                             .unwrap()
@@ -96,8 +105,7 @@ impl RedisBackend {
                             .unwrap();
                     }
                 }
-
-                let val: f64 = connection.get("random").unwrap();
+                let val: f64 = connection.get(received.key_name).unwrap();
                 println!("val: {val}");
             }
         });
@@ -105,30 +113,33 @@ impl RedisBackend {
         Ok(())
     }
 
-    fn inc(&mut self, value: f64) {
+    fn inc(&self, value: f64) {
         self.redis_job_tx
             .send(RedisJob {
                 action: BackendAction::Inc,
+                key_name: self.key_name.clone(),
                 value,
                 result_tx: None,
             })
             .unwrap();
     }
 
-    fn dec(&mut self, value: f64) {
+    fn dec(&self, value: f64) {
         self.redis_job_tx
             .send(RedisJob {
                 action: BackendAction::Dec,
+                key_name: self.key_name.clone(),
                 value: -value,
                 result_tx: None,
             })
             .unwrap();
     }
 
-    fn set(&mut self, value: f64) {
+    fn set(&self, value: f64) {
         self.redis_job_tx
             .send(RedisJob {
                 action: BackendAction::Set,
+                key_name: self.key_name.clone(),
                 value,
                 result_tx: None,
             })
@@ -140,6 +151,7 @@ impl RedisBackend {
         self.redis_job_tx
             .send(RedisJob {
                 action: BackendAction::Get,
+                key_name: self.key_name.clone(),
                 value: f64::NAN,
                 result_tx: Some(tx),
             })
