@@ -5,10 +5,17 @@ build-backend = "maturin"
 [project]
 name = "pytheus-backend-rs"
 requires-python = ">=3.8"
+authors = [
+  { name="Llandy Riveron Del Risco", email="llandy3d@gmail.com" },
+]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
-    "Programming Language :: Python :: Implementation :: PyPy",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
 ]
 
 
