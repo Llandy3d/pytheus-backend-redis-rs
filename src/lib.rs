@@ -1,9 +1,11 @@
+use itertools::Itertools;
 use pyo3::exceptions::PyException;
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
 use redis::Commands;
 use redis::{Connection, RedisResult};
+use std::collections::HashMap;
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 
@@ -41,6 +43,7 @@ struct RedisBackend {
     histogram_bucket: Option<String>,
     redis_job_tx: mpsc::Sender<RedisJob>,
     key_name: String,
+    labels_hash: Option<String>,
 }
 
 fn create_redis_connection() -> RedisResult<Connection> {
@@ -53,14 +56,52 @@ fn create_redis_connection() -> RedisResult<Connection> {
 impl RedisBackend {
     #[new]
     fn new(config: &PyDict, metric: &PyAny, histogram_bucket: Option<String>) -> PyResult<Self> {
+        // producer
         let redis_job_tx_mutex = REDIS_JOB_TX.get().unwrap();
         let redis_job_tx = redis_job_tx_mutex.lock().unwrap();
         let cloned_tx = redis_job_tx.clone();
 
+        let py = metric.py();
+        let collector = metric.getattr(intern!(metric.py(), "_collector"))?;
+
         let key_name: String = metric
-            .getattr(intern!(metric.py(), "_collector"))?
-            .getattr(intern!(metric.py(), "name"))?
+            .getattr(intern!(py, "_collector"))?
+            .getattr(intern!(py, "name"))?
             .extract()?;
+
+        let mut default_labels: Option<HashMap<&str, &str>> = None;
+        let mut metric_labels: Option<HashMap<&str, &str>> = None;
+
+        let py_metric_labels = metric.getattr(intern!(py, "_labels"))?;
+        if py_metric_labels.is_true()? {
+            let labels: HashMap<&str, &str> = py_metric_labels.extract()?;
+            metric_labels = Some(labels);
+        }
+
+        // default labels
+        if collector
+            .getattr(intern!(py, "_default_labels_count"))?
+            .is_true()?
+        {
+            let labels: HashMap<&str, &str> = collector
+                .getattr(intern!(py, "_default_labels"))?
+                .extract()?;
+
+            default_labels = Some(labels);
+        }
+
+        let to_hash = {
+            if let Some(mut default_labels) = default_labels {
+                if let Some(metric_labels) = metric_labels {
+                    default_labels.extend(&metric_labels);
+                }
+                Some(default_labels)
+            } else {
+                metric_labels
+            }
+        };
+
+        let labels_hash = to_hash.map(|labels| labels.values().sorted().join("-"));
 
         Ok(Self {
             config: config.into(),
@@ -68,6 +109,7 @@ impl RedisBackend {
             histogram_bucket,
             redis_job_tx: cloned_tx,
             key_name,
+            labels_hash,
         })
     }
 
