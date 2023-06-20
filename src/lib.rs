@@ -11,6 +11,7 @@ use std::thread;
 
 // This could be completely wrong, not sure if it would break the channel, let's try 🤞
 static REDIS_JOB_TX: OnceLock<Mutex<mpsc::Sender<RedisJob>>> = OnceLock::new();
+const EXPIRE_KEY_SECONDS: usize = 3600;
 
 #[derive(Debug)]
 enum BackendAction {
@@ -132,25 +133,56 @@ impl RedisBackend {
             while let Ok(received) = rx.recv() {
                 println!("Got: {:?}", received);
                 match received.action {
-                    BackendAction::Inc | BackendAction::Dec => match received.labels_hash {
-                        Some(labels_hash) => connection
-                            .hincr(&received.key_name, &labels_hash, received.value)
-                            .unwrap(),
-                        None => connection.incr(&received.key_name, received.value).unwrap(),
-                    },
-                    BackendAction::Set => match received.labels_hash {
-                        Some(labels_hash) => connection
-                            .hset(&received.key_name, &labels_hash, received.value)
-                            .unwrap(),
-                        None => connection.set(&received.key_name, received.value).unwrap(),
-                    },
+                    BackendAction::Inc | BackendAction::Dec => {
+                        match received.labels_hash {
+                            Some(labels_hash) => connection
+                                .hincr(&received.key_name, &labels_hash, received.value)
+                                .unwrap(),
+                            None => connection.incr(&received.key_name, received.value).unwrap(),
+                        }
+                        let _: () = connection
+                            .expire(&received.key_name, EXPIRE_KEY_SECONDS)
+                            .unwrap();
+                    }
+                    BackendAction::Set => {
+                        match received.labels_hash {
+                            Some(labels_hash) => connection
+                                .hset(&received.key_name, &labels_hash, received.value)
+                                .unwrap(),
+                            None => connection.set(&received.key_name, received.value).unwrap(),
+                        }
+                        let _: () = connection
+                            .expire(&received.key_name, EXPIRE_KEY_SECONDS)
+                            .unwrap();
+                    }
                     BackendAction::Get => {
-                        let value: f64 = match received.labels_hash {
-                            Some(labels_hash) => {
-                                connection.hget(&received.key_name, &labels_hash).unwrap()
-                            }
-                            None => connection.get(&received.key_name).unwrap(),
+                        let get_result: Result<f64, redis::RedisError> = match received.labels_hash
+                        {
+                            Some(labels_hash) => connection.hget(&received.key_name, &labels_hash),
+                            None => connection.get(&received.key_name),
                         };
+                        let value: f64 = match get_result {
+                            Ok(value) => {
+                                // TODO: most likely will need to queue these operations
+                                // waiting on the expire call before returning the value is not
+                                // good
+                                let _: () = connection
+                                    .expire(&received.key_name, EXPIRE_KEY_SECONDS)
+                                    .unwrap();
+                                value
+                            }
+                            Err(e) => {
+                                if e.kind() == redis::ErrorKind::TypeError {
+                                    // This would happen when there is no key so `nil` is returned
+                                    // so we return the default 0.0 value
+                                    0.0
+                                } else {
+                                    // TODO: will need to handle the panic
+                                    panic!("{e:?}");
+                                }
+                            }
+                        };
+
                         received
                             .result_tx
                             .unwrap()
