@@ -48,8 +48,9 @@ struct RedisBackend {
     labels_hash: Option<String>,
 }
 
-fn create_redis_connection() -> RedisResult<Connection> {
-    let client = redis::Client::open("redis://127.0.0.1/")?;
+fn create_redis_connection(host: &str, port: u16) -> RedisResult<Connection> {
+    let url = format!("redis://{host}:{port}");
+    let client = redis::Client::open(url)?;
     let con = client.get_connection()?;
     Ok(con)
 }
@@ -116,10 +117,14 @@ impl RedisBackend {
     }
 
     #[classmethod]
-    fn _initialize(cls: &PyType, _config: &PyDict) -> PyResult<()> {
+    fn _initialize(cls: &PyType, config: &PyDict) -> PyResult<()> {
         println!("hello: {}", cls);
 
-        let mut connection = match create_redis_connection() {
+        // using the PyAny::get_item so that it will raise a KeyError on missing key
+        let host: &str = PyAny::get_item(config, intern!(config.py(), "host"))?.extract()?;
+        let port: u16 = PyAny::get_item(config, intern!(config.py(), "port"))?.extract()?;
+
+        let mut connection = match create_redis_connection(host, port) {
             Ok(connection) => connection,
             Err(e) => return Err(PyException::new_err(e.to_string())),
         };
