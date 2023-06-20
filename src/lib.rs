@@ -29,6 +29,7 @@ struct RedisJobResult {
 struct RedisJob {
     action: BackendAction,
     key_name: String,
+    labels_hash: Option<String>,
     value: f64,
     result_tx: Option<mpsc::Sender<RedisJobResult>>,
 }
@@ -48,7 +49,7 @@ struct RedisBackend {
 
 fn create_redis_connection() -> RedisResult<Connection> {
     let client = redis::Client::open("redis://127.0.0.1/")?;
-    let mut con = client.get_connection()?;
+    let con = client.get_connection()?;
     Ok(con)
 }
 
@@ -114,7 +115,7 @@ impl RedisBackend {
     }
 
     #[classmethod]
-    fn _initialize(cls: &PyType, config: &PyDict) -> PyResult<()> {
+    fn _initialize(cls: &PyType, _config: &PyDict) -> PyResult<()> {
         println!("hello: {}", cls);
 
         let mut connection = match create_redis_connection() {
@@ -128,18 +129,28 @@ impl RedisBackend {
 
         thread::spawn(move || {
             println!("In thread....");
-
             while let Ok(received) = rx.recv() {
                 println!("Got: {:?}", received);
                 match received.action {
-                    BackendAction::Inc | BackendAction::Dec => {
-                        let _: () = connection.incr(&received.key_name, received.value).unwrap();
-                    }
-                    BackendAction::Set => {
-                        let _: () = connection.set(&received.key_name, received.value).unwrap();
-                    }
+                    BackendAction::Inc | BackendAction::Dec => match received.labels_hash {
+                        Some(labels_hash) => connection
+                            .hincr(&received.key_name, &labels_hash, received.value)
+                            .unwrap(),
+                        None => connection.incr(&received.key_name, received.value).unwrap(),
+                    },
+                    BackendAction::Set => match received.labels_hash {
+                        Some(labels_hash) => connection
+                            .hset(&received.key_name, &labels_hash, received.value)
+                            .unwrap(),
+                        None => connection.set(&received.key_name, received.value).unwrap(),
+                    },
                     BackendAction::Get => {
-                        let value: f64 = connection.get(&received.key_name).unwrap();
+                        let value: f64 = match received.labels_hash {
+                            Some(labels_hash) => {
+                                connection.hget(&received.key_name, &labels_hash).unwrap()
+                            }
+                            None => connection.get(&received.key_name).unwrap(),
+                        };
                         received
                             .result_tx
                             .unwrap()
@@ -147,8 +158,6 @@ impl RedisBackend {
                             .unwrap();
                     }
                 }
-                let val: f64 = connection.get(received.key_name).unwrap();
-                println!("val: {val}");
             }
         });
 
@@ -160,6 +169,7 @@ impl RedisBackend {
             .send(RedisJob {
                 action: BackendAction::Inc,
                 key_name: self.key_name.clone(),
+                labels_hash: self.labels_hash.clone(), // I wonder if only the String inside should be cloned into a new Some
                 value,
                 result_tx: None,
             })
@@ -171,6 +181,7 @@ impl RedisBackend {
             .send(RedisJob {
                 action: BackendAction::Dec,
                 key_name: self.key_name.clone(),
+                labels_hash: self.labels_hash.clone(),
                 value: -value,
                 result_tx: None,
             })
@@ -182,6 +193,7 @@ impl RedisBackend {
             .send(RedisJob {
                 action: BackendAction::Set,
                 key_name: self.key_name.clone(),
+                labels_hash: self.labels_hash.clone(),
                 value,
                 result_tx: None,
             })
@@ -194,6 +206,7 @@ impl RedisBackend {
             .send(RedisJob {
                 action: BackendAction::Get,
                 key_name: self.key_name.clone(),
+                labels_hash: self.labels_hash.clone(),
                 value: f64::NAN,
                 result_tx: Some(tx),
             })
