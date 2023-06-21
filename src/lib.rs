@@ -67,10 +67,14 @@ impl RedisBackend {
         let py = metric.py();
         let collector = metric.getattr(intern!(metric.py(), "_collector"))?;
 
-        let key_name: String = metric
+        let mut key_name: String = metric
             .getattr(intern!(py, "_collector"))?
             .getattr(intern!(py, "name"))?
             .extract()?;
+
+        if let Some(bucket_id) = histogram_bucket.clone() {
+            key_name = format!("{key_name}:{bucket_id}");
+        }
 
         let mut default_labels: Option<HashMap<&str, &str>> = None;
         let mut metric_labels: Option<HashMap<&str, &str>> = None;
