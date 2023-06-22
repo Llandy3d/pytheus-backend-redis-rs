@@ -48,6 +48,14 @@ struct RedisBackend {
     labels_hash: Option<String>,
 }
 
+// Sample(suffix='_bucket', labels={'le': '0.005'}, value=0.0
+#[derive(Debug, FromPyObject)]
+struct Sample<'a> {
+    suffix: &'a str,
+    labels: Option<HashMap<&'a str, &'a str>>,
+    value: f64,
+}
+
 fn create_redis_connection(host: &str, port: u16) -> RedisResult<Connection> {
     let url = format!("redis://{host}:{port}");
     let client = redis::Client::open(url)?;
@@ -205,6 +213,47 @@ impl RedisBackend {
         Ok(())
     }
 
+    #[classmethod]
+    fn _generate_samples(cls: &PyType, registry: &PyAny) -> PyResult<()> {
+        let py = cls.py();
+        // let samples_dict: HashMap<&str, &str>;
+        let collectors = registry.call_method0(intern!(py, "collect"))?;
+
+        let metric_collectors: PyResult<Vec<&PyAny>> = collectors
+            .iter()?
+            .map(|i| i.and_then(PyAny::extract))
+            .collect();
+        println!("{metric_collectors:?}");
+
+        // let samples_book: HashMap<&PyAny, Vec<&Sample>> = HashMap::new();
+        // TODO: implement an appropriate struct and IntoPy for returning a dict if HashMap is not
+        // possible
+        let mut samples_book: Vec<(&PyAny, Vec<Sample>)> = vec![];
+        // TODO: need to support custom collectors
+        for metric_collector in metric_collectors? {
+            println!("{metric_collector:?}");
+
+            let mut samples_list: Vec<Sample> = vec![];
+
+            let samples: PyResult<Vec<&PyAny>> = metric_collector
+                .call_method0(intern!(py, "collect"))?
+                .iter()?
+                .map(|i| i.and_then(PyAny::extract))
+                .collect();
+
+            for sample in samples? {
+                let sample: Sample = sample.extract()?;
+                samples_list.push(sample);
+            }
+
+            // samples_book.insert(metric_collector, samples_list);
+            samples_book.push((metric_collector, samples_list));
+            println!("{samples_book:?}");
+        }
+
+        Ok(())
+    }
+
     fn inc(&self, value: f64) {
         self.redis_job_tx
             .send(RedisJob {
@@ -241,21 +290,26 @@ impl RedisBackend {
             .unwrap();
     }
 
-    fn get(&self) -> f64 {
-        let (tx, rx) = mpsc::channel();
-        self.redis_job_tx
-            .send(RedisJob {
-                action: BackendAction::Get,
-                key_name: self.key_name.clone(),
-                labels_hash: self.labels_hash.clone(),
-                value: f64::NAN,
-                result_tx: Some(tx),
-            })
-            .unwrap();
+    // fn get(&self) -> f64 {
+    //     let (tx, rx) = mpsc::channel();
+    //     self.redis_job_tx
+    //         .send(RedisJob {
+    //             action: BackendAction::Get,
+    //             key_name: self.key_name.clone(),
+    //             labels_hash: self.labels_hash.clone(),
+    //             value: f64::NAN,
+    //             result_tx: Some(tx),
+    //         })
+    //         .unwrap();
 
-        // TODO: should free the GIL in here
-        let job_result = rx.recv().unwrap();
-        job_result.value
+    //     // TODO: should free the GIL in here
+    //     let job_result = rx.recv().unwrap();
+    //     job_result.value
+    // }
+    // }
+
+    fn get(&self) -> f64 {
+        0.0
     }
 }
 
