@@ -50,10 +50,60 @@ struct RedisBackend {
 
 // Sample(suffix='_bucket', labels={'le': '0.005'}, value=0.0
 #[derive(Debug, FromPyObject)]
-struct Sample<'a> {
-    suffix: &'a str,
-    labels: Option<HashMap<&'a str, &'a str>>,
+struct Sample {
+    suffix: String,
+    labels: Option<HashMap<String, String>>,
     value: f64,
+}
+
+#[derive(Debug)]
+#[pyclass]
+struct OutSample {
+    #[pyo3(get)]
+    suffix: String,
+    #[pyo3(get)]
+    labels: Option<HashMap<String, String>>,
+    #[pyo3(get)]
+    value: f64,
+}
+
+impl OutSample {
+    fn new(suffix: String, labels: Option<HashMap<String, String>>, value: f64) -> Self {
+        Self {
+            suffix,
+            labels,
+            value,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SamplesResultDict {
+    collectors: Vec<Py<PyAny>>,
+    samples_vec: Vec<Vec<OutSample>>,
+}
+
+impl SamplesResultDict {
+    fn new() -> Self {
+        Self {
+            collectors: vec![],
+            samples_vec: vec![],
+        }
+    }
+}
+
+impl IntoPy<PyResult<PyObject>> for SamplesResultDict {
+    fn into_py(self, py: Python<'_>) -> PyResult<PyObject> {
+        let pydict = PyDict::new(py);
+        for (collector, samples) in self
+            .collectors
+            .into_iter()
+            .zip(self.samples_vec.into_iter())
+        {
+            pydict.set_item(collector, samples.into_py(py))?;
+        }
+        Ok(pydict.into())
+    }
 }
 
 fn create_redis_connection(host: &str, port: u16) -> RedisResult<Connection> {
@@ -214,9 +264,8 @@ impl RedisBackend {
     }
 
     #[classmethod]
-    fn _generate_samples(cls: &PyType, registry: &PyAny) -> PyResult<()> {
+    fn _generate_samples(cls: &PyType, registry: &PyAny) -> PyResult<PyObject> {
         let py = cls.py();
-        // let samples_dict: HashMap<&str, &str>;
         let collectors = registry.call_method0(intern!(py, "collect"))?;
 
         let metric_collectors: PyResult<Vec<&PyAny>> = collectors
@@ -225,15 +274,12 @@ impl RedisBackend {
             .collect();
         println!("{metric_collectors:?}");
 
-        // let samples_book: HashMap<&PyAny, Vec<&Sample>> = HashMap::new();
-        // TODO: implement an appropriate struct and IntoPy for returning a dict if HashMap is not
-        // possible
-        let mut samples_book: Vec<(&PyAny, Vec<Sample>)> = vec![];
+        let mut samples_result_dict = SamplesResultDict::new();
         // TODO: need to support custom collectors
         for metric_collector in metric_collectors? {
             println!("{metric_collector:?}");
 
-            let mut samples_list: Vec<Sample> = vec![];
+            let mut samples_list: Vec<OutSample> = vec![];
 
             let samples: PyResult<Vec<&PyAny>> = metric_collector
                 .call_method0(intern!(py, "collect"))?
@@ -243,15 +289,19 @@ impl RedisBackend {
 
             for sample in samples? {
                 let sample: Sample = sample.extract()?;
-                samples_list.push(sample);
+                // struct used for converting from python back into python are different
+                // probably because they share the same name with the existing `Sample` class
+                let out_sample = OutSample::new(sample.suffix, sample.labels, sample.value);
+                samples_list.push(out_sample);
             }
 
-            // samples_book.insert(metric_collector, samples_list);
-            samples_book.push((metric_collector, samples_list));
-            println!("{samples_book:?}");
+            // TODO: remember to actually make the redis call 🫠
+
+            samples_result_dict.collectors.push(metric_collector.into());
+            samples_result_dict.samples_vec.push(samples_list);
         }
 
-        Ok(())
+        samples_result_dict.into_py(py)
     }
 
     fn inc(&self, value: f64) {
@@ -309,6 +359,11 @@ impl RedisBackend {
     // }
 
     fn get(&self) -> f64 {
+        // This returns 0.0 so that we have a list of Samples ready that we can update the value
+        // after retrieving the value from redis. We need this behaviour due to the current mixed
+        // architecture.
+        // TODO: consider if it makes sense to support the get operation out of the metrics
+        // retrieval.
         0.0
     }
 }
@@ -362,5 +417,6 @@ impl SingleProcessBackend {
 fn pytheus_backend_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<RedisBackend>()?;
     m.add_class::<SingleProcessBackend>()?;
+    m.add_class::<OutSample>()?;
     Ok(())
 }
