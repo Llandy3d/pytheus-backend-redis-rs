@@ -23,18 +23,20 @@ enum BackendAction {
 
 #[derive(Debug)]
 struct RedisJobResult {
-    value: f64,
+    // value: f64,
+    values: Vec<f64>,
 }
 
-#[derive(Debug)]
 struct RedisJob {
     action: BackendAction,
     key_name: String,
     labels_hash: Option<String>,
     value: f64,
     result_tx: Option<mpsc::Sender<RedisJobResult>>,
+    pipeline: Option<redis::Pipeline>,
 }
 
+#[derive(Debug)]
 #[pyclass]
 struct RedisBackend {
     #[pyo3(get)]
@@ -50,10 +52,11 @@ struct RedisBackend {
 
 // Sample(suffix='_bucket', labels={'le': '0.005'}, value=0.0
 #[derive(Debug, FromPyObject)]
-struct Sample {
+struct Sample<'a> {
     suffix: String,
     labels: Option<HashMap<String, String>>,
-    value: f64,
+    // value: f64,
+    value: PyRef<'a, RedisBackend>,
 }
 
 #[derive(Debug)]
@@ -198,7 +201,6 @@ impl RedisBackend {
         thread::spawn(move || {
             println!("In thread....");
             while let Ok(received) = rx.recv() {
-                println!("Got: {:?}", received);
                 match received.action {
                     BackendAction::Inc | BackendAction::Dec => {
                         match received.labels_hash {
@@ -223,39 +225,50 @@ impl RedisBackend {
                             .unwrap();
                     }
                     BackendAction::Get => {
-                        let get_result: Result<f64, redis::RedisError> = match received.labels_hash
-                        {
-                            Some(labels_hash) => connection.hget(&received.key_name, &labels_hash),
-                            None => connection.get(&received.key_name),
-                        };
-                        let value: f64 = match get_result {
-                            Ok(value) => {
-                                // TODO: most likely will need to queue these operations
-                                // waiting on the expire call before returning the value is not
-                                // good
-                                let _: () = connection
-                                    .expire(&received.key_name, EXPIRE_KEY_SECONDS)
-                                    .unwrap();
-                                value
-                            }
-                            Err(e) => {
-                                if e.kind() == redis::ErrorKind::TypeError {
-                                    // This would happen when there is no key so `nil` is returned
-                                    // so we return the default 0.0 value
-                                    0.0
-                                } else {
-                                    // TODO: will need to handle the panic
-                                    panic!("{e:?}");
-                                }
-                            }
-                        };
+                        let pipe = received.pipeline.unwrap();
+                        let results: Vec<Option<f64>> = pipe.query(&mut connection).unwrap();
+
+                        let values = results.into_iter().map(|val| val.unwrap_or(0f64)).collect();
 
                         received
                             .result_tx
                             .unwrap()
-                            .send(RedisJobResult { value })
+                            .send(RedisJobResult { values })
                             .unwrap();
-                    }
+                    } // BackendAction::Get => {
+                      //     let get_result: Result<f64, redis::RedisError> = match received.labels_hash
+                      //     {
+                      //         Some(labels_hash) => connection.hget(&received.key_name, &labels_hash),
+                      //         None => connection.get(&received.key_name),
+                      //     };
+                      //     let value: f64 = match get_result {
+                      //         Ok(value) => {
+                      //             // TODO: most likely will need to queue these operations
+                      //             // waiting on the expire call before returning the value is not
+                      //             // good
+                      //             let _: () = connection
+                      //                 .expire(&received.key_name, EXPIRE_KEY_SECONDS)
+                      //                 .unwrap();
+                      //             value
+                      //         }
+                      //         Err(e) => {
+                      //             if e.kind() == redis::ErrorKind::TypeError {
+                      //                 // This would happen when there is no key so `nil` is returned
+                      //                 // so we return the default 0.0 value
+                      //                 0.0
+                      //             } else {
+                      //                 // TODO: will need to handle the panic
+                      //                 panic!("{e:?}");
+                      //             }
+                      //         }
+                      //     };
+
+                      //     received
+                      //         .result_tx
+                      //         .unwrap()
+                      //         .send(RedisJobResult { value })
+                      //         .unwrap();
+                      // }
                 }
             }
         });
@@ -275,6 +288,9 @@ impl RedisBackend {
         println!("{metric_collectors:?}");
 
         let mut samples_result_dict = SamplesResultDict::new();
+
+        let mut pipe = redis::pipe();
+
         // TODO: need to support custom collectors
         for metric_collector in metric_collectors? {
             println!("{metric_collector:?}");
@@ -289,18 +305,60 @@ impl RedisBackend {
 
             for sample in samples? {
                 let sample: Sample = sample.extract()?;
+
                 // struct used for converting from python back into python are different
                 // probably because they share the same name with the existing `Sample` class
-                let out_sample = OutSample::new(sample.suffix, sample.labels, sample.value);
-                samples_list.push(out_sample);
-            }
+                println!("{sample:?}");
 
-            // TODO: remember to actually make the redis call 🫠
+                let out_sample = OutSample::new(sample.suffix, sample.labels, 0.0);
+                samples_list.push(out_sample);
+
+                // pipe the get command
+                let key_name = &sample.value.key_name;
+                let label_hash = &sample.value.labels_hash;
+
+                match label_hash {
+                    Some(label_hash) => pipe.hget(key_name, label_hash),
+                    None => pipe.get(key_name),
+                };
+                pipe.expire(key_name, EXPIRE_KEY_SECONDS).ignore();
+            }
 
             samples_result_dict.collectors.push(metric_collector.into());
             samples_result_dict.samples_vec.push(samples_list);
         }
 
+        let redis_job_tx_mutex = REDIS_JOB_TX.get().unwrap();
+        let redis_job_tx = redis_job_tx_mutex.lock().unwrap();
+
+        let (tx, rx) = mpsc::channel();
+
+        redis_job_tx
+            .send(RedisJob {
+                action: BackendAction::Get,
+                key_name: "".to_string(),
+                labels_hash: None,
+                value: f64::NAN,
+                result_tx: Some(tx),
+                pipeline: Some(pipe),
+            })
+            .unwrap();
+
+        // TODO: release gil
+
+        let job_result = rx.recv().unwrap();
+
+        // map back the values from redis into the appropriate Sample
+        let mut samples_vec_united = vec![];
+        for samples_vec in &mut samples_result_dict.samples_vec {
+            samples_vec_united.extend(samples_vec);
+        }
+
+        for (sample, value) in samples_vec_united.iter_mut().zip(job_result.values) {
+            sample.value = value
+        }
+
+        println!("{samples_result_dict:?}");
         samples_result_dict.into_py(py)
     }
 
@@ -312,6 +370,7 @@ impl RedisBackend {
                 labels_hash: self.labels_hash.clone(), // I wonder if only the String inside should be cloned into a new Some
                 value,
                 result_tx: None,
+                pipeline: None,
             })
             .unwrap();
     }
@@ -324,6 +383,7 @@ impl RedisBackend {
                 labels_hash: self.labels_hash.clone(),
                 value: -value,
                 result_tx: None,
+                pipeline: None,
             })
             .unwrap();
     }
@@ -336,6 +396,7 @@ impl RedisBackend {
                 labels_hash: self.labels_hash.clone(),
                 value,
                 result_tx: None,
+                pipeline: None,
             })
             .unwrap();
     }
@@ -358,13 +419,15 @@ impl RedisBackend {
     // }
     // }
 
-    fn get(&self) -> f64 {
+    // fn get(&self) -> f64 {
+    fn get(self_: PyRef<Self>) -> PyRef<'_, RedisBackend> {
         // This returns 0.0 so that we have a list of Samples ready that we can update the value
         // after retrieving the value from redis. We need this behaviour due to the current mixed
         // architecture.
         // TODO: consider if it makes sense to support the get operation out of the metrics
         // retrieval.
-        0.0
+        // 0.0
+        self_
     }
 }
 
