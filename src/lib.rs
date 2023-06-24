@@ -285,7 +285,6 @@ impl RedisBackend {
             .iter()?
             .map(|i| i.and_then(PyAny::extract))
             .collect();
-        println!("{metric_collectors:?}");
 
         let mut samples_result_dict = SamplesResultDict::new();
 
@@ -293,8 +292,6 @@ impl RedisBackend {
 
         // TODO: need to support custom collectors
         for metric_collector in metric_collectors? {
-            println!("{metric_collector:?}");
-
             let mut samples_list: Vec<OutSample> = vec![];
 
             let samples: PyResult<Vec<&PyAny>> = metric_collector
@@ -308,8 +305,6 @@ impl RedisBackend {
 
                 // struct used for converting from python back into python are different
                 // probably because they share the same name with the existing `Sample` class
-                println!("{sample:?}");
-
                 let out_sample = OutSample::new(sample.suffix, sample.labels, 0.0);
                 samples_list.push(out_sample);
 
@@ -346,19 +341,22 @@ impl RedisBackend {
 
         // TODO: release gil
 
-        let job_result = rx.recv().unwrap();
+        let samples_result_dict = py.allow_threads(move || {
+            let job_result = rx.recv().unwrap();
 
-        // map back the values from redis into the appropriate Sample
-        let mut samples_vec_united = vec![];
-        for samples_vec in &mut samples_result_dict.samples_vec {
-            samples_vec_united.extend(samples_vec);
-        }
+            // map back the values from redis into the appropriate Sample
+            let mut samples_vec_united = vec![];
+            for samples_vec in &mut samples_result_dict.samples_vec {
+                samples_vec_united.extend(samples_vec);
+            }
 
-        for (sample, value) in samples_vec_united.iter_mut().zip(job_result.values) {
-            sample.value = value
-        }
+            for (sample, value) in samples_vec_united.iter_mut().zip(job_result.values) {
+                sample.value = value
+            }
 
-        println!("{samples_result_dict:?}");
+            samples_result_dict
+        });
+
         samples_result_dict.into_py(py)
     }
 
