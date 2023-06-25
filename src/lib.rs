@@ -1,3 +1,4 @@
+use crossbeam::channel;
 use itertools::Itertools;
 use pyo3::exceptions::PyException;
 use pyo3::intern;
@@ -11,19 +12,17 @@ use std::thread;
 
 // This could be completely wrong, not sure if it would break the channel, let's try 🤞
 static REDIS_JOB_TX: OnceLock<Mutex<mpsc::Sender<RedisJob>>> = OnceLock::new();
+static REDIS_PIPELINE_JOB_TX: OnceLock<Mutex<channel::Sender<RedisPipelineJob>>> = OnceLock::new();
 const EXPIRE_KEY_SECONDS: usize = 3600;
 
-#[derive(Debug)]
 enum BackendAction {
     Inc,
     Dec,
     Set,
-    Get,
 }
 
 #[derive(Debug)]
-struct RedisJobResult {
-    // value: f64,
+struct RedisPipelineJobResult {
     values: Vec<f64>,
 }
 
@@ -32,8 +31,11 @@ struct RedisJob {
     key_name: String,
     labels_hash: Option<String>,
     value: f64,
-    result_tx: Option<mpsc::Sender<RedisJobResult>>,
-    pipeline: Option<redis::Pipeline>,
+}
+
+struct RedisPipelineJob {
+    pipeline: redis::Pipeline,
+    result_tx: mpsc::Sender<RedisPipelineJobResult>,
 }
 
 #[derive(Debug)]
@@ -55,7 +57,6 @@ struct RedisBackend {
 struct Sample<'a> {
     suffix: String,
     labels: Option<HashMap<String, String>>,
-    // value: f64,
     value: PyRef<'a, RedisBackend>,
 }
 
@@ -182,9 +183,7 @@ impl RedisBackend {
     }
 
     #[classmethod]
-    fn _initialize(cls: &PyType, config: &PyDict) -> PyResult<()> {
-        println!("hello: {}", cls);
-
+    fn _initialize(_cls: &PyType, config: &PyDict) -> PyResult<()> {
         // using the PyAny::get_item so that it will raise a KeyError on missing key
         let host: &str = PyAny::get_item(config, intern!(config.py(), "host"))?.extract()?;
         let port: u16 = PyAny::get_item(config, intern!(config.py(), "port"))?.extract()?;
@@ -198,8 +197,33 @@ impl RedisBackend {
         let (tx, rx) = mpsc::channel();
         REDIS_JOB_TX.get_or_init(|| Mutex::new(tx));
 
+        let (pipeline_tx, pipeline_rx) = crossbeam::channel::unbounded();
+        REDIS_PIPELINE_JOB_TX.get_or_init(|| Mutex::new(pipeline_tx));
+
+        for i in 0..4 {
+            let cloned_pipeline_rx = pipeline_rx.clone();
+            let mut pipeline_connection = match create_redis_connection(host, port) {
+                Ok(connection) => connection,
+                Err(e) => return Err(PyException::new_err(e.to_string())),
+            };
+            thread::spawn(move || {
+                println!("Starting pipeline thread....{i}");
+                while let Ok(received) = cloned_pipeline_rx.recv() {
+                    let pipe = received.pipeline;
+                    let results: Vec<Option<f64>> = pipe.query(&mut pipeline_connection).unwrap();
+
+                    let values = results.into_iter().map(|val| val.unwrap_or(0f64)).collect();
+
+                    received
+                        .result_tx
+                        .send(RedisPipelineJobResult { values })
+                        .unwrap();
+                }
+            });
+        }
+
         thread::spawn(move || {
-            println!("In thread....");
+            println!("Starting BackendAction thread....");
             while let Ok(received) = rx.recv() {
                 match received.action {
                     BackendAction::Inc | BackendAction::Dec => {
@@ -224,51 +248,6 @@ impl RedisBackend {
                             .expire(&received.key_name, EXPIRE_KEY_SECONDS)
                             .unwrap();
                     }
-                    BackendAction::Get => {
-                        let pipe = received.pipeline.unwrap();
-                        let results: Vec<Option<f64>> = pipe.query(&mut connection).unwrap();
-
-                        let values = results.into_iter().map(|val| val.unwrap_or(0f64)).collect();
-
-                        received
-                            .result_tx
-                            .unwrap()
-                            .send(RedisJobResult { values })
-                            .unwrap();
-                    } // BackendAction::Get => {
-                      //     let get_result: Result<f64, redis::RedisError> = match received.labels_hash
-                      //     {
-                      //         Some(labels_hash) => connection.hget(&received.key_name, &labels_hash),
-                      //         None => connection.get(&received.key_name),
-                      //     };
-                      //     let value: f64 = match get_result {
-                      //         Ok(value) => {
-                      //             // TODO: most likely will need to queue these operations
-                      //             // waiting on the expire call before returning the value is not
-                      //             // good
-                      //             let _: () = connection
-                      //                 .expire(&received.key_name, EXPIRE_KEY_SECONDS)
-                      //                 .unwrap();
-                      //             value
-                      //         }
-                      //         Err(e) => {
-                      //             if e.kind() == redis::ErrorKind::TypeError {
-                      //                 // This would happen when there is no key so `nil` is returned
-                      //                 // so we return the default 0.0 value
-                      //                 0.0
-                      //             } else {
-                      //                 // TODO: will need to handle the panic
-                      //                 panic!("{e:?}");
-                      //             }
-                      //         }
-                      //     };
-
-                      //     received
-                      //         .result_tx
-                      //         .unwrap()
-                      //         .send(RedisJobResult { value })
-                      //         .unwrap();
-                      // }
                 }
             }
         });
@@ -324,25 +303,19 @@ impl RedisBackend {
         }
 
         let send_tx = {
-            let redis_job_tx_mutex = REDIS_JOB_TX.get().unwrap();
-            let redis_job_tx = redis_job_tx_mutex.lock().unwrap();
-            redis_job_tx.clone()
+            let redis_pipeline_job_tx_job_tx_mutex = REDIS_PIPELINE_JOB_TX.get().unwrap();
+            let redis_pipeline_job_tx = redis_pipeline_job_tx_job_tx_mutex.lock().unwrap();
+            redis_pipeline_job_tx.clone()
         };
 
         let (tx, rx) = mpsc::channel();
 
         send_tx
-            .send(RedisJob {
-                action: BackendAction::Get,
-                key_name: "".to_string(),
-                labels_hash: None,
-                value: f64::NAN,
-                result_tx: Some(tx),
-                pipeline: Some(pipe),
+            .send(RedisPipelineJob {
+                result_tx: tx,
+                pipeline: pipe,
             })
             .unwrap();
-
-        // TODO: release gil
 
         let job_result = rx.recv().unwrap();
 
@@ -355,7 +328,6 @@ impl RedisBackend {
         for (sample, value) in samples_vec_united.iter_mut().zip(job_result.values) {
             sample.value = value
         }
-
         samples_result_dict.into_py(py)
     }
 
@@ -366,8 +338,6 @@ impl RedisBackend {
                 key_name: self.key_name.clone(),
                 labels_hash: self.labels_hash.clone(), // I wonder if only the String inside should be cloned into a new Some
                 value,
-                result_tx: None,
-                pipeline: None,
             })
             .unwrap();
     }
@@ -379,8 +349,6 @@ impl RedisBackend {
                 key_name: self.key_name.clone(),
                 labels_hash: self.labels_hash.clone(),
                 value: -value,
-                result_tx: None,
-                pipeline: None,
             })
             .unwrap();
     }
@@ -392,38 +360,13 @@ impl RedisBackend {
                 key_name: self.key_name.clone(),
                 labels_hash: self.labels_hash.clone(),
                 value,
-                result_tx: None,
-                pipeline: None,
             })
             .unwrap();
     }
 
-    // fn get(&self) -> f64 {
-    //     let (tx, rx) = mpsc::channel();
-    //     self.redis_job_tx
-    //         .send(RedisJob {
-    //             action: BackendAction::Get,
-    //             key_name: self.key_name.clone(),
-    //             labels_hash: self.labels_hash.clone(),
-    //             value: f64::NAN,
-    //             result_tx: Some(tx),
-    //         })
-    //         .unwrap();
-
-    //     // TODO: should free the GIL in here
-    //     let job_result = rx.recv().unwrap();
-    //     job_result.value
-    // }
-    // }
-
-    // fn get(&self) -> f64 {
     fn get(self_: PyRef<Self>) -> PyRef<'_, RedisBackend> {
-        // This returns 0.0 so that we have a list of Samples ready that we can update the value
-        // after retrieving the value from redis. We need this behaviour due to the current mixed
-        // architecture.
-        // TODO: consider if it makes sense to support the get operation out of the metrics
-        // retrieval.
-        // 0.0
+        // This returns itself so that we have a RedisBackend instance to retrieve key_name and
+        // labels_hash to query redis when collecting samples via a pipeline.
         self_
     }
 }
