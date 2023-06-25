@@ -344,21 +344,17 @@ impl RedisBackend {
 
         // TODO: release gil
 
-        let samples_result_dict = py.allow_threads(move || {
-            let job_result = rx.recv().unwrap();
+        let job_result = rx.recv().unwrap();
 
-            // map back the values from redis into the appropriate Sample
-            let mut samples_vec_united = vec![];
-            for samples_vec in &mut samples_result_dict.samples_vec {
-                samples_vec_united.extend(samples_vec);
-            }
+        // map back the values from redis into the appropriate Sample
+        let mut samples_vec_united = vec![];
+        for samples_vec in &mut samples_result_dict.samples_vec {
+            samples_vec_united.extend(samples_vec);
+        }
 
-            for (sample, value) in samples_vec_united.iter_mut().zip(job_result.values) {
-                sample.value = value
-            }
-
-            samples_result_dict
-        });
+        for (sample, value) in samples_vec_united.iter_mut().zip(job_result.values) {
+            sample.value = value
+        }
 
         samples_result_dict.into_py(py)
     }
