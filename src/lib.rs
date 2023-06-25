@@ -323,12 +323,15 @@ impl RedisBackend {
             samples_result_dict.samples_vec.push(samples_list);
         }
 
-        let redis_job_tx_mutex = REDIS_JOB_TX.get().unwrap();
-        let redis_job_tx = redis_job_tx_mutex.lock().unwrap();
+        let send_tx = {
+            let redis_job_tx_mutex = REDIS_JOB_TX.get().unwrap();
+            let redis_job_tx = redis_job_tx_mutex.lock().unwrap();
+            redis_job_tx.clone()
+        };
 
         let (tx, rx) = mpsc::channel();
 
-        redis_job_tx
+        send_tx
             .send(RedisJob {
                 action: BackendAction::Get,
                 key_name: "".to_string(),
