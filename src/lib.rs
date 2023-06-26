@@ -5,7 +5,6 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
 use redis::Commands;
-use redis::{Connection, RedisResult};
 use std::collections::HashMap;
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
@@ -110,11 +109,14 @@ impl IntoPy<PyResult<PyObject>> for SamplesResultDict {
     }
 }
 
-fn create_redis_connection(host: &str, port: u16) -> RedisResult<Connection> {
+fn create_redis_pool(
+    host: &str,
+    port: u16,
+) -> Result<r2d2::Pool<redis::Client>, Box<dyn std::error::Error>> {
     let url = format!("redis://{host}:{port}");
     let client = redis::Client::open(url)?;
-    let con = client.get_connection()?;
-    Ok(con)
+    let pool = r2d2::Pool::builder().build(client)?;
+    Ok(pool)
 }
 
 #[pymethods]
@@ -188,8 +190,8 @@ impl RedisBackend {
         let host: &str = PyAny::get_item(config, intern!(config.py(), "host"))?.extract()?;
         let port: u16 = PyAny::get_item(config, intern!(config.py(), "port"))?.extract()?;
 
-        let mut connection = match create_redis_connection(host, port) {
-            Ok(connection) => connection,
+        let pool = match create_redis_pool(host, port) {
+            Ok(pool) => pool,
             Err(e) => return Err(PyException::new_err(e.to_string())),
         };
 
@@ -202,15 +204,16 @@ impl RedisBackend {
 
         for i in 0..4 {
             let cloned_pipeline_rx = pipeline_rx.clone();
-            let mut pipeline_connection = match create_redis_connection(host, port) {
-                Ok(connection) => connection,
-                Err(e) => return Err(PyException::new_err(e.to_string())),
-            };
+            let pool = pool.clone();
             thread::spawn(move || {
                 println!("Starting pipeline thread....{i}");
                 while let Ok(received) = cloned_pipeline_rx.recv() {
+                    // NOTE: this is slowing benchmarks, but in theory the `/metrics` endpoint
+                    // wouldn't be called so many times.
+                    // Might want to reuse the same connection & try to acquire a new one on issues
+                    let mut connection = pool.get().unwrap();
                     let pipe = received.pipeline;
-                    let results: Vec<Option<f64>> = pipe.query(&mut pipeline_connection).unwrap();
+                    let results: Vec<Option<f64>> = pipe.query(&mut connection).unwrap();
 
                     let values = results.into_iter().map(|val| val.unwrap_or(0f64)).collect();
 
@@ -225,6 +228,7 @@ impl RedisBackend {
         thread::spawn(move || {
             println!("Starting BackendAction thread....");
             while let Ok(received) = rx.recv() {
+                let mut connection = pool.get().unwrap();
                 match received.action {
                     BackendAction::Inc | BackendAction::Dec => {
                         match received.labels_hash {
