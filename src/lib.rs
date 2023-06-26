@@ -327,12 +327,7 @@ impl RedisBackend {
             })
             .unwrap();
 
-        // in theory we could allow other python threads to run while waiting for the result but
-        // it seems there is a cost associated with it. By using the allow_thread approach it makes
-        // it faster for concurrent scrapes but the `/metrics` endpoint is not really called that
-        // often, usually 15s. So it's preffered to have this faster method.
-        // let job_result = py.allow_threads(move || rx.recv().unwrap());
-        let job_result = rx.recv().unwrap();
+        let job_result = py.allow_threads(move || rx.recv().unwrap());
 
         // map back the values from redis into the appropriate Sample
         let mut samples_vec_united = vec![];
