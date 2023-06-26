@@ -5,6 +5,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
 use redis::Commands;
+use redis::ConnectionLike;
 use std::collections::HashMap;
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
@@ -207,11 +208,13 @@ impl RedisBackend {
             let pool = pool.clone();
             thread::spawn(move || {
                 println!("Starting pipeline thread....{i}");
+                let mut connection = pool.get().unwrap();
                 while let Ok(received) = cloned_pipeline_rx.recv() {
-                    // NOTE: this is slowing benchmarks, but in theory the `/metrics` endpoint
-                    // wouldn't be called so many times.
-                    // Might want to reuse the same connection & try to acquire a new one on issues
-                    let mut connection = pool.get().unwrap();
+                    // let mut connection = pool.get().unwrap();
+                    if !connection.is_open() {
+                        connection = pool.get().unwrap();
+                    }
+
                     let pipe = received.pipeline;
                     let results: Vec<Option<f64>> = pipe.query(&mut connection).unwrap();
 
@@ -227,8 +230,11 @@ impl RedisBackend {
 
         thread::spawn(move || {
             println!("Starting BackendAction thread....");
+            let mut connection = pool.get().unwrap();
             while let Ok(received) = rx.recv() {
-                let mut connection = pool.get().unwrap();
+                if !connection.is_open() {
+                    connection = pool.get().unwrap();
+                }
                 match received.action {
                     BackendAction::Inc | BackendAction::Dec => {
                         match received.labels_hash {
@@ -321,6 +327,11 @@ impl RedisBackend {
             })
             .unwrap();
 
+        // in theory we could allow other python threads to run while waiting for the result but
+        // it seems there is a cost associated with it. By using the allow_thread approach it makes
+        // it faster for concurrent scrapes but the `/metrics` endpoint is not really called that
+        // often, usually 15s. So it's preffered to have this faster method.
+        // let job_result = py.allow_threads(move || rx.recv().unwrap());
         let job_result = rx.recv().unwrap();
 
         // map back the values from redis into the appropriate Sample
