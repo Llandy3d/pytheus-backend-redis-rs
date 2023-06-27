@@ -4,7 +4,6 @@ use pyo3::exceptions::PyException;
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
-use redis::Commands;
 use redis::ConnectionLike;
 use std::collections::HashMap;
 use std::sync::{mpsc, Mutex, OnceLock};
@@ -120,6 +119,29 @@ fn create_redis_pool(
     Ok(pool)
 }
 
+fn add_job_to_pipeline(received: RedisJob, pipe: &mut redis::Pipeline) {
+    match received.action {
+        BackendAction::Inc | BackendAction::Dec => {
+            match received.labels_hash {
+                Some(labels_hash) => pipe
+                    .hincr(&received.key_name, &labels_hash, received.value)
+                    .ignore(),
+                None => pipe.incr(&received.key_name, received.value).ignore(),
+            };
+            pipe.expire(&received.key_name, EXPIRE_KEY_SECONDS).ignore();
+        }
+        BackendAction::Set => {
+            match received.labels_hash {
+                Some(labels_hash) => pipe
+                    .hset(&received.key_name, &labels_hash, received.value)
+                    .ignore(),
+                None => pipe.set(&received.key_name, received.value).ignore(),
+            };
+            pipe.expire(&received.key_name, EXPIRE_KEY_SECONDS).ignore();
+        }
+    }
+}
+
 #[pymethods]
 impl RedisBackend {
     #[new]
@@ -210,7 +232,6 @@ impl RedisBackend {
                 println!("Starting pipeline thread....{i}");
                 let mut connection = pool.get().unwrap();
                 while let Ok(received) = cloned_pipeline_rx.recv() {
-                    // let mut connection = pool.get().unwrap();
                     if !connection.is_open() {
                         connection = pool.get().unwrap();
                     }
@@ -235,30 +256,16 @@ impl RedisBackend {
                 if !connection.is_open() {
                     connection = pool.get().unwrap();
                 }
-                match received.action {
-                    BackendAction::Inc | BackendAction::Dec => {
-                        match received.labels_hash {
-                            Some(labels_hash) => connection
-                                .hincr(&received.key_name, &labels_hash, received.value)
-                                .unwrap(),
-                            None => connection.incr(&received.key_name, received.value).unwrap(),
-                        }
-                        let _: () = connection
-                            .expire(&received.key_name, EXPIRE_KEY_SECONDS)
-                            .unwrap();
-                    }
-                    BackendAction::Set => {
-                        match received.labels_hash {
-                            Some(labels_hash) => connection
-                                .hset(&received.key_name, &labels_hash, received.value)
-                                .unwrap(),
-                            None => connection.set(&received.key_name, received.value).unwrap(),
-                        }
-                        let _: () = connection
-                            .expire(&received.key_name, EXPIRE_KEY_SECONDS)
-                            .unwrap();
-                    }
+
+                let mut pipe = redis::pipe();
+
+                add_job_to_pipeline(received, &mut pipe);
+
+                for received in rx.try_iter() {
+                    add_job_to_pipeline(received, &mut pipe);
                 }
+
+                let _: () = pipe.query(&mut connection).unwrap();
             }
         });
 
