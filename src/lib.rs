@@ -1,5 +1,6 @@
 use crossbeam::channel;
 use itertools::Itertools;
+use log::info;
 use pyo3::exceptions::PyException;
 use pyo3::intern;
 use pyo3::prelude::*;
@@ -243,9 +244,8 @@ impl RedisBackend {
         for i in 0..4 {
             let cloned_pipeline_rx = pipeline_rx.clone();
             let pool = pool.clone();
+            info!("Starting pipeline thread....{i}");
             thread::spawn(move || {
-                println!("Starting pipeline thread....{i}");
-
                 // the first connection happens at startup so we let it panic
                 let mut connection = pool.get().unwrap();
                 while let Ok(received) = cloned_pipeline_rx.recv() {
@@ -259,8 +259,8 @@ impl RedisBackend {
             });
         }
 
+        info!("Starting BackendAction thread....");
         thread::spawn(move || {
-            println!("Starting BackendAction thread....");
             let mut connection = pool.get().unwrap();
             while let Ok(received) = rx.recv() {
                 if !connection.is_open() {
@@ -279,6 +279,7 @@ impl RedisBackend {
             }
         });
 
+        info!("RedisBackend initialized");
         Ok(())
     }
 
@@ -445,6 +446,8 @@ impl SingleProcessBackend {
 /// A Python module implemented in Rust.
 #[pymodule]
 fn pytheus_backend_rs(_py: Python, m: &PyModule) -> PyResult<()> {
+    pyo3_log::init();
+
     m.add_class::<RedisBackend>()?;
     m.add_class::<SingleProcessBackend>()?;
     m.add_class::<OutSample>()?;
