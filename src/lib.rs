@@ -1,6 +1,6 @@
 use crossbeam::channel;
 use itertools::Itertools;
-use log::info;
+use log::{error, info};
 use pyo3::exceptions::PyException;
 use pyo3::intern;
 use pyo3::prelude::*;
@@ -367,7 +367,7 @@ impl RedisBackend {
                 labels_hash: self.labels_hash.clone(), // I wonder if only the String inside should be cloned into a new Some
                 value,
             })
-            .unwrap();
+            .unwrap_or_else(|_| error!("`inc` operation failed"));
     }
 
     fn dec(&self, value: f64) {
@@ -378,7 +378,7 @@ impl RedisBackend {
                 labels_hash: self.labels_hash.clone(),
                 value: -value,
             })
-            .unwrap();
+            .unwrap_or_else(|_| error!("`dec` operation failed"));
     }
 
     fn set(&self, value: f64) {
@@ -389,7 +389,7 @@ impl RedisBackend {
                 labels_hash: self.labels_hash.clone(),
                 value,
             })
-            .unwrap();
+            .unwrap_or_else(|_| error!("`set` operation failed"));
     }
 
     fn get(self_: PyRef<Self>) -> PyRef<'_, RedisBackend> {
