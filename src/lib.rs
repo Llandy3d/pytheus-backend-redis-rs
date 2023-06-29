@@ -22,7 +22,7 @@ enum BackendAction {
 
 #[derive(Debug)]
 struct RedisPipelineJobResult {
-    values: Vec<f64>,
+    values: Result<Vec<f64>, PyErr>,
 }
 
 struct RedisJob {
@@ -142,6 +142,21 @@ fn add_job_to_pipeline(received: RedisJob, pipe: &mut redis::Pipeline) {
     }
 }
 
+fn handle_generate_metrics_job(
+    pipeline: redis::Pipeline,
+    connection: &mut r2d2::PooledConnection<redis::Client>,
+    pool: &r2d2::Pool<redis::Client>,
+) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+    if !connection.is_open() {
+        *connection = pool.get()?
+    }
+
+    let results: Vec<Option<f64>> = pipeline.query(connection)?;
+    let values = results.into_iter().map(|val| val.unwrap_or(0f64)).collect();
+
+    Ok(values)
+}
+
 #[pymethods]
 impl RedisBackend {
     #[new]
@@ -230,21 +245,16 @@ impl RedisBackend {
             let pool = pool.clone();
             thread::spawn(move || {
                 println!("Starting pipeline thread....{i}");
+
+                // the first connection happens at startup so we let it panic
                 let mut connection = pool.get().unwrap();
                 while let Ok(received) = cloned_pipeline_rx.recv() {
-                    if !connection.is_open() {
-                        connection = pool.get().unwrap();
-                    }
+                    let values =
+                        handle_generate_metrics_job(received.pipeline, &mut connection, &pool);
+                    let values = values.map_err(|e| PyException::new_err(e.to_string()));
 
-                    let pipe = received.pipeline;
-                    let results: Vec<Option<f64>> = pipe.query(&mut connection).unwrap();
-
-                    let values = results.into_iter().map(|val| val.unwrap_or(0f64)).collect();
-
-                    received
-                        .result_tx
-                        .send(RedisPipelineJobResult { values })
-                        .unwrap();
+                    // NOTE: might want to log the failure
+                    let _ = received.result_tx.send(RedisPipelineJobResult { values });
                 }
             });
         }
@@ -342,7 +352,7 @@ impl RedisBackend {
             samples_vec_united.extend(samples_vec);
         }
 
-        for (sample, value) in samples_vec_united.iter_mut().zip(job_result.values) {
+        for (sample, value) in samples_vec_united.iter_mut().zip(job_result.values?) {
             sample.value = value
         }
         samples_result_dict.into_py(py)
