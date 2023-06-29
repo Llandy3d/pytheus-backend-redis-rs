@@ -158,6 +158,29 @@ fn handle_generate_metrics_job(
     Ok(values)
 }
 
+fn handle_backend_action_job(
+    received: RedisJob,
+    connection: &mut r2d2::PooledConnection<redis::Client>,
+    pool: &r2d2::Pool<redis::Client>,
+    rx: &mpsc::Receiver<RedisJob>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !connection.is_open() {
+        *connection = pool.get()?;
+    }
+
+    let mut pipe = redis::pipe();
+
+    add_job_to_pipeline(received, &mut pipe);
+
+    for received in rx.try_iter() {
+        add_job_to_pipeline(received, &mut pipe);
+    }
+
+    pipe.query::<()>(connection)?;
+
+    Ok(())
+}
+
 #[pymethods]
 impl RedisBackend {
     #[new]
@@ -260,22 +283,12 @@ impl RedisBackend {
         }
 
         info!("Starting BackendAction thread....");
-        thread::spawn(move || {
+        thread::spawn(move || loop {
+            // the first connection happens at startup so we let it panic
             let mut connection = pool.get().unwrap();
             while let Ok(received) = rx.recv() {
-                if !connection.is_open() {
-                    connection = pool.get().unwrap();
-                }
-
-                let mut pipe = redis::pipe();
-
-                add_job_to_pipeline(received, &mut pipe);
-
-                for received in rx.try_iter() {
-                    add_job_to_pipeline(received, &mut pipe);
-                }
-
-                let _: () = pipe.query(&mut connection).unwrap();
+                handle_backend_action_job(received, &mut connection, &pool, &rx)
+                    .unwrap_or_else(|e| error!("{}", e.to_string()));
             }
         });
 
