@@ -43,8 +43,10 @@ jobs:
       - name: pytest
         if: ${{ startsWith(matrix.target, 'x86_64') }}
         shell: bash
-        run: |
+        install: |
+          apt-get update
           apt-get install -y redis-server
+        run: |
           set -e
           pip install pytheus-backend-rs --find-links dist --force-reinstall
           pip install pytest pytest-redis pytheus
@@ -92,7 +94,6 @@ jobs:
         if: ${{ !startsWith(matrix.target, 'aarch64') }}
         shell: bash
         run: |
-          apt-get install -y redis-server
           set -e
           pip install pytheus-backend-rs --find-links dist --force-reinstall
           pip install pytest pytest-redis pytheus
@@ -123,7 +124,6 @@ jobs:
         if: ${{ !startsWith(matrix.target, 'aarch64') }}
         shell: bash
         run: |
-          apt-get install -y redis-server
           set -e
           pip install pytheus-backend-rs --find-links dist --force-reinstall
           pip install pytest pytest-redis pytheus
