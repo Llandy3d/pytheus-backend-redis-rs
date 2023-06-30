@@ -48,7 +48,9 @@ struct RedisBackend {
     #[pyo3(get)]
     histogram_bucket: Option<String>,
     redis_job_tx: mpsc::Sender<RedisJob>,
+    #[pyo3(get)]
     key_name: String,
+    #[pyo3(get)]
     labels_hash: Option<String>,
 }
 
