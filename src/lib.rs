@@ -1,3 +1,5 @@
+mod atomic;
+
 use crossbeam::channel;
 use itertools::Itertools;
 use log::{error, info};
@@ -7,6 +9,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
 use redis::ConnectionLike;
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 
@@ -458,6 +461,46 @@ impl SingleProcessBackend {
     }
 }
 
+#[pyclass]
+struct SingleProcessAtomicBackend {
+    #[pyo3(get)]
+    config: Py<PyDict>,
+    #[pyo3(get)]
+    metric: Py<PyAny>,
+    #[pyo3(get)]
+    histogram_bucket: Option<String>,
+    value: atomic::AtomicF64,
+}
+
+#[pymethods]
+impl SingleProcessAtomicBackend {
+    #[new]
+    fn new(config: &PyDict, metric: &PyAny, histogram_bucket: Option<String>) -> Self {
+        Self {
+            config: config.into(),
+            metric: metric.into(),
+            histogram_bucket,
+            value: atomic::AtomicF64::new(0.0),
+        }
+    }
+
+    fn inc(&mut self, value: f64) {
+        self.value.fetch_add(value, Ordering::Relaxed);
+    }
+
+    fn dec(&mut self, value: f64) {
+        self.value.fetch_sub(value, Ordering::Relaxed);
+    }
+
+    fn set(&mut self, value: f64) {
+        self.value.store(value, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> f64 {
+        self.value.load(Ordering::Relaxed)
+    }
+}
+
 /// A Python module implemented in Rust.
 #[pymodule]
 fn pytheus_backend_rs(_py: Python, m: &PyModule) -> PyResult<()> {
@@ -465,6 +508,7 @@ fn pytheus_backend_rs(_py: Python, m: &PyModule) -> PyResult<()> {
 
     m.add_class::<RedisBackend>()?;
     m.add_class::<SingleProcessBackend>()?;
+    m.add_class::<SingleProcessAtomicBackend>()?;
     m.add_class::<OutSample>()?;
     Ok(())
 }
