@@ -1,9 +1,12 @@
 import time
+
+from concurrent.futures import ProcessPoolExecutor
 from pytest_redis import factories
 from pytheus.backends import load_backend
-from pytheus.metrics import Counter, Histogram
+from pytheus.metrics import Counter, Histogram, Gauge, Summary
 from pytheus.registry import CollectorRegistry
 from pytheus_backend_rs import RedisBackend
+from pytheus.exposition import generate_metrics
 
 
 redis_server = factories.redis_proc(port=9000)
@@ -158,3 +161,36 @@ def test_generate_samples_with_labels():
     counter.labels({"bob": "b"})
     samples = RedisBackend._generate_samples(registry)
     assert len(samples[counter._collector]) == 3
+
+
+def _run_multiprocess(extra_label):
+    load_backend(
+        backend_class=RedisBackend,
+        backend_config={"host": "127.0.0.1", "port": 6379},
+    )
+    registry = CollectorRegistry()
+    counter = Counter("name_multiple", "desc", required_labels=["bob"], registry=registry)
+    counter.labels(bob="cat")
+    gauge = Gauge("gauge_multiple", "desc", required_labels=["bob"], registry=registry)
+    summary = Summary("summary_multiple", "desc", required_labels=["bob"], registry=registry)
+    histogram = Histogram("histogram_multiple", "desc", required_labels=["bob"], registry=registry)
+    if extra_label:
+        counter.labels(bob="created_only_on_one").inc(3.0)
+        gauge.labels(bob="observable_only_on_one").inc(2.7)
+        summary.labels(bob="observable_only_on_one").observe(2.7)
+        histogram.labels(bob="observable_only_on_one").observe(2.7)
+    return generate_metrics(registry)
+
+
+def test_multiple_return_all_metrics_entries():
+    """
+    Test that if a metric labeled child is created on a process, it will be retrieved even if the
+    instance doesn't exist on a different process.
+    """
+    with ProcessPoolExecutor() as executor:
+        first_result = executor.submit(_run_multiprocess, extra_label=True)
+        first_result = first_result.result()
+        second_result = executor.submit(_run_multiprocess, extra_label=False)
+        second_result = second_result.result()
+
+        assert first_result == second_result

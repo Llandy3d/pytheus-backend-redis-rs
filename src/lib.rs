@@ -239,16 +239,28 @@ impl RedisBackend {
             }
         };
 
-        let labels_hash = to_hash.map(|labels| labels.values().sorted().join("-"));
+        let labels_hash = {
+            if let Some(labels) = to_hash {
+                match serde_json::to_string(&labels) {
+                    Ok(hash) => Some(hash),
+                    Err(e) => return Err(PyException::new_err(e.to_string())),
+                }
+            } else {
+                None
+            }
+        };
 
-        Ok(Self {
+        let new_backend = Self {
             config: config.into(),
             metric: metric.into(),
             histogram_bucket,
             redis_job_tx: cloned_tx,
             key_name,
             labels_hash,
-        })
+        };
+
+        new_backend._initialize_key();
+        Ok(new_backend)
     }
 
     #[classmethod]
@@ -375,6 +387,17 @@ impl RedisBackend {
             sample.value = value
         }
         samples_result_dict.into_py(py)
+    }
+
+    fn _initialize_key(&self) {
+        self.redis_job_tx
+            .send(RedisJob {
+                action: BackendAction::Inc,
+                key_name: self.key_name.clone(),
+                labels_hash: self.labels_hash.clone(), // I wonder if only the String inside should be cloned into a new Some
+                value: 0.0,
+            })
+            .unwrap_or_else(|_| error!("`_initialize_key` operation failed"));
     }
 
     fn inc(&self, value: f64) {
