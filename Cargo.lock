@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "pytheus-backend-rs"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "crossbeam",
  "itertools",
