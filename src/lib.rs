@@ -65,13 +65,13 @@ struct OutSample {
     #[pyo3(get)]
     suffix: String,
     #[pyo3(get)]
-    labels: Option<HashMap<String, String>>,
+    labels: Option<BTreeMap<String, String>>,
     #[pyo3(get)]
     value: f64,
 }
 
 impl OutSample {
-    fn new(suffix: String, labels: Option<HashMap<String, String>>, value: f64) -> Self {
+    fn new(suffix: String, labels: Option<BTreeMap<String, String>>, value: f64) -> Self {
         Self {
             suffix,
             labels,
@@ -447,7 +447,7 @@ impl RedisBackend {
                     }
                     PipelineResult::Hash(hash) => {
                         for (labels, value) in hash {
-                            let labels_map: HashMap<String, String> = {
+                            let labels_map: BTreeMap<String, String> = {
                                 match serde_json::from_str(labels) {
                                     Ok(map) => map,
                                     Err(e) => return Err(PyException::new_err(e.to_string())),
@@ -497,7 +497,7 @@ impl RedisBackend {
                         };
 
                         for (labels, value) in count_hash {
-                            let labels_map: HashMap<String, String> = {
+                            let labels_map: BTreeMap<String, String> = {
                                 match serde_json::from_str(labels) {
                                     Ok(map) => map,
                                     Err(e) => return Err(PyException::new_err(e.to_string())),
@@ -515,7 +515,7 @@ impl RedisBackend {
                         }
 
                         for (labels, value) in sum_hash {
-                            let labels_map: HashMap<String, String> = {
+                            let labels_map: BTreeMap<String, String> = {
                                 match serde_json::from_str(labels) {
                                     Ok(map) => map,
                                     Err(e) => return Err(PyException::new_err(e.to_string())),
@@ -582,7 +582,7 @@ impl RedisBackend {
                                     samples_list.push(out_sample);
                                 }
                                 _ => {
-                                    let mut labels_map = HashMap::new();
+                                    let mut labels_map = BTreeMap::new();
                                     labels_map.insert("le".to_string(), suffix.to_string());
                                     let out_sample = OutSample::new(
                                         "_bucket".to_string(),
@@ -631,7 +631,7 @@ impl RedisBackend {
                             match suffix {
                                 "count" => {
                                     for (labels, value) in hash {
-                                        let labels_map: HashMap<String, String> = {
+                                        let labels_map: BTreeMap<String, String> = {
                                             match serde_json::from_str(labels) {
                                                 Ok(map) => map,
                                                 Err(e) => {
@@ -652,7 +652,7 @@ impl RedisBackend {
                                 }
                                 "sum" => {
                                     for (labels, value) in hash {
-                                        let labels_map: HashMap<String, String> = {
+                                        let labels_map: BTreeMap<String, String> = {
                                             match serde_json::from_str(labels) {
                                                 Ok(map) => map,
                                                 Err(e) => {
@@ -673,7 +673,7 @@ impl RedisBackend {
                                 }
                                 _ => {
                                     for (labels, value) in hash {
-                                        let mut labels_map: HashMap<String, String> = {
+                                        let mut labels_map: BTreeMap<String, String> = {
                                             match serde_json::from_str(labels) {
                                                 Ok(map) => map,
                                                 Err(e) => {
