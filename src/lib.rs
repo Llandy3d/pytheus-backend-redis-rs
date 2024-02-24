@@ -7,7 +7,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
 use redis::{from_redis_value, ConnectionLike, FromRedisValue, RedisResult, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
@@ -223,12 +223,14 @@ impl RedisBackend {
             key_name = format!("{key_name}:{bucket_id}");
         }
 
-        let mut default_labels: Option<HashMap<&str, &str>> = None;
-        let mut metric_labels: Option<HashMap<&str, &str>> = None;
+        // BTreeMap is used to order by key so that the labels_hash will
+        // always be sorted
+        let mut default_labels: Option<BTreeMap<&str, &str>> = None;
+        let mut metric_labels: Option<BTreeMap<&str, &str>> = None;
 
         let py_metric_labels = metric.getattr(intern!(py, "_labels"))?;
         if py_metric_labels.is_true()? {
-            let labels: HashMap<&str, &str> = py_metric_labels.extract()?;
+            let labels: BTreeMap<&str, &str> = py_metric_labels.extract()?;
             metric_labels = Some(labels);
         }
 
@@ -237,7 +239,7 @@ impl RedisBackend {
             .getattr(intern!(py, "_default_labels_count"))?
             .is_true()?
         {
-            let labels: HashMap<&str, &str> = collector
+            let labels: BTreeMap<&str, &str> = collector
                 .getattr(intern!(py, "_default_labels"))?
                 .extract()?;
 
