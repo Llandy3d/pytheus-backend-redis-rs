@@ -351,7 +351,6 @@ impl RedisBackend {
             samples_result_dict.samples_vec.push(samples_list);
 
             let key_name: &str = metric_collector.getattr(intern!(py, "name"))?.extract()?;
-            // TODO: continue
 
             let collector_type: &str = metric_collector.getattr(intern!(py, "type_"))?.extract()?;
             let has_labels: bool = metric_collector
@@ -751,10 +750,10 @@ impl RedisBackend {
             .unwrap_or_else(|_| error!("`set` operation failed"));
     }
 
-    fn get(self_: PyRef<Self>) -> PyRef<'_, RedisBackend> {
-        // This returns itself so that we have a RedisBackend instance to retrieve key_name and
-        // labels_hash to query redis when collecting samples via a pipeline.
-        self_
+    fn get(&self) -> f64 {
+        // This returns the float 0.0 because it's only called when an existing collector is not
+        // able to find the data in the cache, meaning that it was not initialized yet.
+        0.0
     }
 }
 
