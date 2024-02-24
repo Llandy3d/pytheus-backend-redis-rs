@@ -1,13 +1,12 @@
 mod atomic;
 
 use crossbeam::channel;
-use itertools::Itertools;
 use log::{error, info};
 use pyo3::exceptions::PyException;
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
-use redis::ConnectionLike;
+use redis::{from_redis_value, ConnectionLike, FromRedisValue, RedisResult, Value};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Mutex, OnceLock};
@@ -18,6 +17,7 @@ static REDIS_JOB_TX: OnceLock<Mutex<mpsc::Sender<RedisJob>>> = OnceLock::new();
 static REDIS_PIPELINE_JOB_TX: OnceLock<Mutex<channel::Sender<RedisPipelineJob>>> = OnceLock::new();
 const EXPIRE_KEY_SECONDS: usize = 3600;
 
+#[derive(Debug)]
 enum BackendAction {
     Inc,
     Dec,
@@ -26,9 +26,11 @@ enum BackendAction {
 
 #[derive(Debug)]
 struct RedisPipelineJobResult {
-    values: Result<Vec<f64>, PyErr>,
+    // values: Result<Vec<f64>, PyErr>,
+    values: Result<Vec<PipelineResult>, PyErr>,
 }
 
+#[derive(Debug)]
 struct RedisJob {
     action: BackendAction,
     key_name: String,
@@ -55,14 +57,6 @@ struct RedisBackend {
     key_name: String,
     #[pyo3(get)]
     labels_hash: Option<String>,
-}
-
-// Sample(suffix='_bucket', labels={'le': '0.005'}, value=0.0
-#[derive(Debug, FromPyObject)]
-struct Sample<'a> {
-    suffix: String,
-    labels: Option<HashMap<String, String>>,
-    value: PyRef<'a, RedisBackend>,
 }
 
 #[derive(Debug)]
@@ -148,17 +142,39 @@ fn add_job_to_pipeline(received: RedisJob, pipe: &mut redis::Pipeline) {
     }
 }
 
+#[derive(Debug)]
+enum PipelineResult {
+    Float(f64),
+    Hash(HashMap<String, String>),
+}
+
+impl FromRedisValue for PipelineResult {
+    fn from_redis_value(v: &Value) -> RedisResult<Self> {
+        let result = match v {
+            Value::Bulk(_) => {
+                let map: HashMap<String, String> = from_redis_value(v)?;
+                PipelineResult::Hash(map)
+            }
+            _ => {
+                let float: Option<f64> = from_redis_value(v)?;
+                PipelineResult::Float(float.unwrap_or(0f64))
+            }
+        };
+
+        Ok(result)
+    }
+}
+
 fn handle_generate_metrics_job(
     pipeline: redis::Pipeline,
     connection: &mut r2d2::PooledConnection<redis::Client>,
     pool: &r2d2::Pool<redis::Client>,
-) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+) -> Result<Vec<PipelineResult>, Box<dyn std::error::Error>> {
     if !connection.is_open() {
         *connection = pool.get()?
     }
 
-    let results: Vec<Option<f64>> = pipeline.query(connection)?;
-    let values = results.into_iter().map(|val| val.unwrap_or(0f64)).collect();
+    let values: Vec<PipelineResult> = pipeline.query(connection)?;
 
     Ok(values)
 }
@@ -329,35 +345,68 @@ impl RedisBackend {
 
         // TODO: need to support custom collectors
         for metric_collector in metric_collectors? {
-            let mut samples_list: Vec<OutSample> = vec![];
-
-            let samples: PyResult<Vec<&PyAny>> = metric_collector
-                .call_method0(intern!(py, "collect"))?
-                .iter()?
-                .map(|i| i.and_then(PyAny::extract))
-                .collect();
-
-            for sample in samples? {
-                let sample: Sample = sample.extract()?;
-
-                // struct used for converting from python back into python are different
-                // probably because they share the same name with the existing `Sample` class
-                let out_sample = OutSample::new(sample.suffix, sample.labels, 0.0);
-                samples_list.push(out_sample);
-
-                // pipe the get command
-                let key_name = &sample.value.key_name;
-                let label_hash = &sample.value.labels_hash;
-
-                match label_hash {
-                    Some(label_hash) => pipe.hget(key_name, label_hash),
-                    None => pipe.get(key_name),
-                };
-                pipe.expire(key_name, EXPIRE_KEY_SECONDS).ignore();
-            }
+            let samples_list: Vec<OutSample> = vec![];
 
             samples_result_dict.collectors.push(metric_collector.into());
             samples_result_dict.samples_vec.push(samples_list);
+
+            let key_name: &str = metric_collector.getattr(intern!(py, "name"))?.extract()?;
+            // TODO: continue
+
+            let collector_type: &str = metric_collector.getattr(intern!(py, "type_"))?.extract()?;
+            let has_labels: bool = metric_collector
+                .getattr(intern!(py, "_required_labels"))?
+                .is_true()?;
+
+            match collector_type {
+                "counter" | "gauge" => {
+                    pipe.expire(key_name, EXPIRE_KEY_SECONDS).ignore();
+                    if has_labels {
+                        pipe.hgetall(key_name);
+                    } else {
+                        pipe.get(key_name);
+                    }
+                }
+                "summary" => {
+                    for suffix in ["count", "sum"] {
+                        let key_with_suffix = format!("{}:{}", key_name, suffix);
+                        pipe.expire(key_with_suffix.clone(), EXPIRE_KEY_SECONDS)
+                            .ignore();
+                        if has_labels {
+                            pipe.hgetall(key_with_suffix);
+                        } else {
+                            pipe.get(key_with_suffix.clone());
+                        }
+                    }
+                }
+                "histogram" => {
+                    let extra_suffixes = ["+Inf", "count", "sum"];
+                    let upper_bounds: Vec<f64> = metric_collector
+                        .getattr(intern!(py, "_metric"))?
+                        .getattr(intern!(py, "_upper_bounds"))?
+                        .extract()?;
+                    let upper_bounds = &upper_bounds[..upper_bounds.len() - 1]; // remove inf
+                    let upper_bounds: Vec<String> =
+                        upper_bounds.iter().map(|bound| bound.to_string()).collect();
+
+                    let suffixes = upper_bounds
+                        .iter()
+                        .map(|bound| bound.as_str())
+                        .chain(extra_suffixes);
+
+                    for suffix in suffixes {
+                        let key_with_suffix = format!("{}:{}", key_name, suffix);
+                        pipe.expire(key_with_suffix.clone(), EXPIRE_KEY_SECONDS)
+                            .ignore();
+                        if has_labels {
+                            pipe.hgetall(key_with_suffix);
+                        } else {
+                            pipe.get(key_with_suffix.clone());
+                        }
+                    }
+                }
+                _ => (),
+            }
         }
 
         let send_tx = {
@@ -376,16 +425,285 @@ impl RedisBackend {
             .unwrap();
 
         let job_result = py.allow_threads(move || rx.recv().unwrap());
+        let values = job_result.values?;
+        let mut values_iterator = values.iter();
 
-        // map back the values from redis into the appropriate Sample
-        let mut samples_vec_united = vec![];
-        for samples_vec in &mut samples_result_dict.samples_vec {
-            samples_vec_united.extend(samples_vec);
+        for (collector, samples_list) in samples_result_dict
+            .collectors
+            .iter_mut()
+            .zip(samples_result_dict.samples_vec.iter_mut())
+        {
+            let collector_type: String =
+                collector.getattr(py, intern!(py, "type_"))?.extract(py)?;
+
+            let mut current_value = values_iterator.next().unwrap();
+
+            match collector_type.as_str() {
+                "counter" | "gauge" => match current_value {
+                    PipelineResult::Float(float) => {
+                        let out_sample = OutSample::new("".to_string(), None, *float);
+                        samples_list.push(out_sample);
+                    }
+                    PipelineResult::Hash(hash) => {
+                        for (labels, value) in hash {
+                            let labels_map: HashMap<String, String> = {
+                                match serde_json::from_str(labels) {
+                                    Ok(map) => map,
+                                    Err(e) => return Err(PyException::new_err(e.to_string())),
+                                }
+                            };
+                            let out_sample = OutSample::new(
+                                "".to_string(),
+                                Some(labels_map),
+                                value.parse::<f64>().unwrap(),
+                            );
+                            samples_list.push(out_sample);
+                        }
+                    }
+                },
+                "summary" => match current_value {
+                    PipelineResult::Float(float) => {
+                        let count_value = float;
+                        current_value = values_iterator.next().unwrap();
+                        let sum_value = {
+                            if let PipelineResult::Float(float) = current_value {
+                                float
+                            } else {
+                                return Err(PyException::new_err(
+                                            "Critical library error while building metrics. Expected float found hash",
+                                        ));
+                            }
+                        };
+
+                        let count_sample = OutSample::new("_count".to_string(), None, *count_value);
+                        let sum_sample = OutSample::new("_sum".to_string(), None, *sum_value);
+                        samples_list.push(count_sample);
+                        samples_list.push(sum_sample);
+                    }
+
+                    PipelineResult::Hash(hash) => {
+                        let mut ordered_samples = HashMap::new();
+                        let count_hash = hash;
+                        current_value = values_iterator.next().unwrap();
+                        let sum_hash = {
+                            if let PipelineResult::Hash(map) = current_value {
+                                map
+                            } else {
+                                return Err(PyException::new_err(
+                                    "Critical library error while building metrics. Expected hash",
+                                ));
+                            }
+                        };
+
+                        for (labels, value) in count_hash {
+                            let labels_map: HashMap<String, String> = {
+                                match serde_json::from_str(labels) {
+                                    Ok(map) => map,
+                                    Err(e) => return Err(PyException::new_err(e.to_string())),
+                                }
+                            };
+                            let out_sample = OutSample::new(
+                                "_count".to_string(),
+                                Some(labels_map),
+                                value.parse::<f64>().unwrap(),
+                            );
+                            ordered_samples
+                                .entry(labels)
+                                .or_insert(vec![])
+                                .push(out_sample);
+                        }
+
+                        for (labels, value) in sum_hash {
+                            let labels_map: HashMap<String, String> = {
+                                match serde_json::from_str(labels) {
+                                    Ok(map) => map,
+                                    Err(e) => return Err(PyException::new_err(e.to_string())),
+                                }
+                            };
+                            let out_sample = OutSample::new(
+                                "_sum".to_string(),
+                                Some(labels_map),
+                                value.parse::<f64>().unwrap(),
+                            );
+                            ordered_samples
+                                .entry(labels)
+                                .or_insert(vec![])
+                                .push(out_sample);
+                        }
+
+                        for ordered_samples_list in ordered_samples.values_mut() {
+                            samples_list.append(ordered_samples_list);
+                        }
+                    }
+                },
+                "histogram" => match current_value {
+                    PipelineResult::Float(float) => {
+                        let mut first_iteration = true;
+                        let extra_suffixes = ["+Inf", "count", "sum"];
+                        let upper_bounds: Vec<f64> = collector
+                            .getattr(py, intern!(py, "_metric"))?
+                            .getattr(py, intern!(py, "_upper_bounds"))?
+                            .extract(py)?;
+                        let upper_bounds = &upper_bounds[..upper_bounds.len() - 1]; // remove inf
+                        let upper_bounds: Vec<String> =
+                            upper_bounds.iter().map(|bound| bound.to_string()).collect();
+
+                        let suffixes = upper_bounds
+                            .iter()
+                            .map(|bound| bound.as_str())
+                            .chain(extra_suffixes);
+
+                        for suffix in suffixes {
+                            let mut float = float;
+                            if !first_iteration {
+                                current_value = values_iterator.next().unwrap();
+                                float = {
+                                    if let PipelineResult::Float(float) = current_value {
+                                        float
+                                    } else {
+                                        return Err(PyException::new_err(
+                                            "Critical library error while building metrics. Expected float found hash",
+                                        ));
+                                    }
+                                };
+                            } else {
+                                first_iteration = false;
+                            }
+                            match suffix {
+                                "count" => {
+                                    let out_sample =
+                                        OutSample::new("_count".to_string(), None, *float);
+                                    samples_list.push(out_sample);
+                                }
+                                "sum" => {
+                                    let out_sample =
+                                        OutSample::new("_sum".to_string(), None, *float);
+                                    samples_list.push(out_sample);
+                                }
+                                _ => {
+                                    let mut labels_map = HashMap::new();
+                                    labels_map.insert("le".to_string(), suffix.to_string());
+                                    let out_sample = OutSample::new(
+                                        "_bucket".to_string(),
+                                        Some(labels_map),
+                                        *float,
+                                    );
+                                    samples_list.push(out_sample);
+                                }
+                            }
+                        }
+                    }
+                    PipelineResult::Hash(hash) => {
+                        let mut first_iteration = true;
+                        let extra_suffixes = ["+Inf", "count", "sum"];
+                        let upper_bounds: Vec<f64> = collector
+                            .getattr(py, intern!(py, "_metric"))?
+                            .getattr(py, intern!(py, "_upper_bounds"))?
+                            .extract(py)?;
+                        let upper_bounds = &upper_bounds[..upper_bounds.len() - 1]; // remove inf
+                        let upper_bounds: Vec<String> =
+                            upper_bounds.iter().map(|bound| bound.to_string()).collect();
+
+                        let suffixes = upper_bounds
+                            .iter()
+                            .map(|bound| bound.as_str())
+                            .chain(extra_suffixes);
+
+                        let mut ordered_samples = HashMap::new();
+
+                        for suffix in suffixes {
+                            let mut hash = hash;
+                            if !first_iteration {
+                                current_value = values_iterator.next().unwrap();
+                                hash = {
+                                    if let PipelineResult::Hash(map) = current_value {
+                                        map
+                                    } else {
+                                        return Err(PyException::new_err(
+                                            "Critical library error while building metrics. Expected hash",
+                                        ));
+                                    }
+                                };
+                            } else {
+                                first_iteration = false;
+                            }
+                            match suffix {
+                                "count" => {
+                                    for (labels, value) in hash {
+                                        let labels_map: HashMap<String, String> = {
+                                            match serde_json::from_str(labels) {
+                                                Ok(map) => map,
+                                                Err(e) => {
+                                                    return Err(PyException::new_err(e.to_string()))
+                                                }
+                                            }
+                                        };
+                                        let out_sample = OutSample::new(
+                                            "_count".to_string(),
+                                            Some(labels_map),
+                                            value.parse::<f64>().unwrap(),
+                                        );
+                                        ordered_samples
+                                            .entry(labels)
+                                            .or_insert(vec![])
+                                            .push(out_sample);
+                                    }
+                                }
+                                "sum" => {
+                                    for (labels, value) in hash {
+                                        let labels_map: HashMap<String, String> = {
+                                            match serde_json::from_str(labels) {
+                                                Ok(map) => map,
+                                                Err(e) => {
+                                                    return Err(PyException::new_err(e.to_string()))
+                                                }
+                                            }
+                                        };
+                                        let out_sample = OutSample::new(
+                                            "_sum".to_string(),
+                                            Some(labels_map),
+                                            value.parse::<f64>().unwrap(),
+                                        );
+                                        ordered_samples
+                                            .entry(labels)
+                                            .or_insert(vec![])
+                                            .push(out_sample);
+                                    }
+                                }
+                                _ => {
+                                    for (labels, value) in hash {
+                                        let mut labels_map: HashMap<String, String> = {
+                                            match serde_json::from_str(labels) {
+                                                Ok(map) => map,
+                                                Err(e) => {
+                                                    return Err(PyException::new_err(e.to_string()))
+                                                }
+                                            }
+                                        };
+                                        labels_map.insert("le".to_string(), suffix.to_string());
+                                        let out_sample = OutSample::new(
+                                            "_bucket".to_string(),
+                                            Some(labels_map),
+                                            value.parse::<f64>().unwrap(),
+                                        );
+                                        ordered_samples
+                                            .entry(labels)
+                                            .or_insert(vec![])
+                                            .push(out_sample);
+                                    }
+                                }
+                            }
+
+                            for ordered_samples_list in ordered_samples.values_mut() {
+                                samples_list.append(ordered_samples_list);
+                            }
+                        }
+                    }
+                },
+                _ => (),
+            }
         }
 
-        for (sample, value) in samples_vec_united.iter_mut().zip(job_result.values?) {
-            sample.value = value
-        }
         samples_result_dict.into_py(py)
     }
 
