@@ -26,7 +26,6 @@ enum BackendAction {
 
 #[derive(Debug)]
 struct RedisPipelineJobResult {
-    // values: Result<Vec<f64>, PyErr>,
     values: Result<Vec<PipelineResult>, PyErr>,
 }
 
