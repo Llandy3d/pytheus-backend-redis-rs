@@ -7,7 +7,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
 use redis::{from_redis_value, ConnectionLike, FromRedisValue, RedisResult, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
@@ -145,14 +145,14 @@ fn add_job_to_pipeline(received: RedisJob, pipe: &mut redis::Pipeline) {
 #[derive(Debug)]
 enum PipelineResult {
     Float(f64),
-    Hash(HashMap<String, String>),
+    Hash(BTreeMap<String, String>),
 }
 
 impl FromRedisValue for PipelineResult {
     fn from_redis_value(v: &Value) -> RedisResult<Self> {
         let result = match v {
             Value::Bulk(_) => {
-                let map: HashMap<String, String> = from_redis_value(v)?;
+                let map: BTreeMap<String, String> = from_redis_value(v)?;
                 PipelineResult::Hash(map)
             }
             _ => {
@@ -483,7 +483,7 @@ impl RedisBackend {
                     }
 
                     PipelineResult::Hash(hash) => {
-                        let mut ordered_samples = HashMap::new();
+                        let mut ordered_samples = BTreeMap::new();
                         let count_hash = hash;
                         current_value = values_iterator.next().unwrap();
                         let sum_hash = {
@@ -610,7 +610,7 @@ impl RedisBackend {
                             .map(|bound| bound.as_str())
                             .chain(extra_suffixes);
 
-                        let mut ordered_samples = HashMap::new();
+                        let mut ordered_samples = BTreeMap::new();
 
                         for suffix in suffixes {
                             let mut hash = hash;
@@ -694,10 +694,9 @@ impl RedisBackend {
                                     }
                                 }
                             }
-
-                            for ordered_samples_list in ordered_samples.values_mut() {
-                                samples_list.append(ordered_samples_list);
-                            }
+                        }
+                        for ordered_samples_list in ordered_samples.values_mut() {
+                            samples_list.append(ordered_samples_list);
                         }
                     }
                 },
